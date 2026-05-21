@@ -158,6 +158,36 @@ def _apply_profile_override() -> None:
         if Path(hermes_home_env).parent.name == "profiles":
             return
 
+    # 1.6 If HERMES_PROFILE env var is set (and no explicit --profile/-p flag,
+    # and HERMES_HOME is not already pointing at a specific profile dir),
+    # honour it so that gateways started as
+    #   HERMES_PROFILE=alice hermes gateway run --replace &
+    # resolve to the profile's own PID file instead of colliding on the
+    # default ~/.hermes/gateway.pid.  This fixes issue #29948: cross-profile
+    # SIGKILL when multiple gateways share $HOME but use different profiles
+    # via HERMES_PROFILE instead of --profile flags.
+    if profile_name is None and not hermes_home_env:
+        hermes_profile_env = os.environ.get("HERMES_PROFILE", "")
+        if hermes_profile_env:
+            try:
+                from hermes_cli.profiles import (
+                    normalize_profile_name,
+                    validate_profile_name,
+                    get_profile_dir,
+                )
+
+                canon = normalize_profile_name(hermes_profile_env)
+                validate_profile_name(canon)
+                # Only honour HERMES_PROFILE if the profile dir actually exists.
+                # This lets gateways started with a stale/wrong HERMES_PROFILE
+                # fall through to active_profile (or no redirect for "default")
+                # instead of crashing via sys.exit(1) in resolve_profile_env().
+                if get_profile_dir(canon).is_dir():
+                    profile_name = canon
+            except (ValueError, FileNotFoundError):
+                # Invalid name — fall through to active_profile.
+                pass
+
     # 2. If no flag, check active_profile in the hermes root
     if profile_name is None:
         try:

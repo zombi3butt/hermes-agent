@@ -3348,7 +3348,19 @@ class AIAgent:
         not receive those image parts, because a rejected tool result becomes
         part of the canonical history and can make the next user turn fail before
         the agent has a chance to recover.
+
+        Non-string results (Python dicts/lists from MCP tools or memory helpers)
+        are JSON-serialised here to prevent HTTP 400 ``invalid message content type``
+        errors on the API side (#29920).
         """
+        # JSON-serialize non-string, non-list results early (#29920).
+        if not isinstance(result, (str, list)):
+            try:
+                return json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError):
+                logger.warning("Failed to JSON-serialize tool result for %s; using repr.", tool_name)
+                return repr(result)
+
         if not _is_multimodal_tool_result(result):
             return result
 

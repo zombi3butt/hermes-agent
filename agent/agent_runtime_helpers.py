@@ -1719,6 +1719,23 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: added %d stub tool result(s)",
             len(missing_results),
         )
+
+    # 3. Coerce non-string tool results to JSON strings (#29920).
+    # MCP tools and memory helpers may return Python dicts/lists as content.
+    # The OpenAI API rejects these with HTTP 400 "invalid message content type".
+    for msg in messages:
+        if msg.get("role") == "tool":
+            content = msg.get("content")
+            if content is not None and not isinstance(content, str):
+                try:
+                    msg["content"] = json.dumps(content, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    _ra().logger.warning(
+                        "Pre-call sanitizer: failed to JSON-serialize tool result for %s",
+                        msg.get("name", "?"),
+                    )
+                    msg["content"] = repr(content)
+
     return messages
 
 

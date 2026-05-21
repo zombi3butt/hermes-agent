@@ -139,3 +139,156 @@ class TestApplyProfileOverrideHermesHomeGuard:
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") is None
+
+
+class TestApplyProfileOverrideHermeProfileEnv:
+    """Tests for HERMES_PROFILE env var support (issue #29948).
+
+    When a user starts gateways via
+      HERMES_PROFILE=alice hermes gateway --replace &
+    the override must resolve to the profile's own PID file, not collide
+    on the default ~/.hermes/gateway.pid.
+    """
+
+    def test_hermes_profile_sets_correct_path(self, tmp_path, monkeypatch):
+        """HERMES_PROFILE=bob + no HERMES_HOME → resolves to profiles/bob."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        profile_dir = hermes_root / "profiles" / "bob"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "bob")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        result = os.environ.get("HERMES_HOME")
+        assert result is not None, "HERMES_HOME must be set from HERMES_PROFILE"
+        assert "profiles" in result
+        assert result.endswith("bob"), f"Expected 'bob' suffix, got: {result!r}"
+
+    def test_profile_flag_takes_precedence_over_hermes_profile(self, tmp_path, monkeypatch):
+        """--profile=-p takes precedence over HERMES_PROFILE env var."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "profiles" / "alice").mkdir(parents=True, exist_ok=True)
+        (hermes_root / "profiles" / "bob").mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "alice")
+        monkeypatch.setattr(sys, "argv", ["hermes", "-p", "bob"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        result = os.environ.get("HERMES_HOME")
+        assert result is not None
+        assert result.endswith("bob"), (
+            f"--profile flag should win over HERMES_PROFILE; expected 'bob', got: {result!r}"
+        )
+
+    def test_hermes_home_profile_dir_bypasses_hermes_profile(self, tmp_path, monkeypatch):
+        """HERMES_HOME already pointing to profile dir → no override."""
+        hermes_root = tmp_path / ".hermes"
+        profile_dir = hermes_root / "profiles" / "alice"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setenv("HERMES_PROFILE", "bob")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") == str(profile_dir), (
+            "HERMES_HOME pointing to a profile dir must bypass HERMES_PROFILE"
+        )
+
+    def test_invalid_hermes_profile_falls_through_to_active_profile(self, tmp_path, monkeypatch):
+        """Invalid HERMES_PROFILE name falls through to active_profile.
+        
+        Note: if active_profile is also set but its profile dir doesn't exist,
+        the existing code calls sys.exit(1) — this test creates the coder dir
+        so active_profile resolves cleanly after HERMES_PROFILE is skipped.
+        """
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("coder")
+        (hermes_root / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "invalid:name!")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        result = os.environ.get("HERMES_HOME")
+        assert result is not None, "Should fall through to active_profile"
+        assert "coder" in result, f"Fell through but wrong profile: {result!r}"
+
+    def test_missing_hermes_profile_falls_through_to_active_profile(self, tmp_path, monkeypatch):
+        """HERMES_PROFILE set but directory missing → falls through to active_profile.
+        
+        If active_profile is "default" (no redirect needed), HERMES_HOME stays unset.
+        If active_profile names a non-existent profile dir, existing code sys.exit(1).
+        This test uses active_profile=default to verify the fall-through path works.
+        """
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("default")
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "nonexistent-profile")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        # Falls through to active_profile which is "default" → HERMES_HOME stays unset
+        assert os.environ.get("HERMES_HOME") is None, (
+            "Missing profile should fall through to active_profile=default → no redirect"
+        )
+
+    def test_no_env_vars_unset_default_profile(self, tmp_path, monkeypatch):
+        """No HERMES_PROFILE, no HERMES_HOME, no active_profile → HERMES_HOME stays unset."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") is None
+
+    def test_hermes_profile_with_active_profile(self, tmp_path, monkeypatch):
+        """HERMES_PROFILE overrides active_profile when no flag is given."""
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("coder")
+        (hermes_root / "profiles" / "bob").mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("HERMES_PROFILE", "bob")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "start"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        result = os.environ.get("HERMES_HOME")
+        assert result is not None
+        assert result.endswith("bob"), (
+            f"HERMES_PROFILE should override active_profile; expected 'bob', got: {result!r}"
+        )

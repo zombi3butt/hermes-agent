@@ -13,6 +13,7 @@ whether the package is importable; the plugin still registers either way so
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
@@ -26,7 +27,20 @@ class DDGSWebSearchProvider(WebSearchProvider):
     No API key needed. Rate limits are enforced server-side by DuckDuckGo;
     the provider surfaces ``DuckDuckGoSearchException`` and other ddgs errors
     as ``{"success": False, "error": ...}`` rather than raising.
+
+    IMPORTANT: The ``ddgs`` package spawns internal ThreadPoolExecutor workers
+    that collide with primp / libcurl state when two instances run concurrently,
+    causing a Python futex_do_wait hard deadlock (CTRL-C immune).  A class-level
+    ``threading.Lock`` serializes all concurrent searches so only one DDGS()
+    instance exists at any time.  This trades throughput for safety — sequential
+    ddgs is slow but stable; parallel search should use a paid backend (Tavily,
+    Firecrawl, Exa, Brave).
+
+    See issue #29966 for the full root-cause analysis.
     """
+
+    # Serialises concurrent DDGS() instantiations inside ``search()``.
+    _lock: threading.Lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -72,19 +86,24 @@ class DDGSWebSearchProvider(WebSearchProvider):
 
         try:
             web_results = []
-            with DDGS() as client:
-                for i, hit in enumerate(client.text(query, max_results=safe_limit)):
-                    if i >= safe_limit:
-                        break
-                    url = str(hit.get("href") or hit.get("url") or "")
-                    web_results.append(
-                        {
-                            "title": str(hit.get("title", "")),
-                            "url": url,
-                            "description": str(hit.get("body", "")),
-                            "position": i + 1,
-                        }
-                    )
+            # Serialize access — concurrent DDGS() instances collide on
+            # primp / libcurl internal state causing futex_do_wait hard
+            # deadlock (CTRL-C immune, issue #29966).  The lock ensures
+            # only one DDGS instance exists at any time.
+            with self._lock:
+                with DDGS() as client:
+                    for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+                        if i >= safe_limit:
+                            break
+                        url = str(hit.get("href") or hit.get("url") or "")
+                        web_results.append(
+                            {
+                                "title": str(hit.get("title", "")),
+                                "url": url,
+                                "description": str(hit.get("body", "")),
+                                "position": i + 1,
+                            }
+                        )
         except Exception as exc:  # noqa: BLE001 — ddgs raises its own exceptions
             logger.warning("DDGS search error: %s", exc)
             return {"success": False, "error": f"DuckDuckGo search failed: {exc}"}

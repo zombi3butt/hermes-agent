@@ -3128,10 +3128,36 @@ class AIAgent:
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
+        raw = base64.b64decode(data)
+
+        # Preflight magic-byte guard (issue #29711): skip data:image payloads
+        # whose decoded bytes do not match the declared MIME type. A single
+        # misclassified non-image attachment can break an entire multimodal
+        # request to Responses-compatible providers with HTTP 400.
+        _IMAGE_MAGIC: dict[str, tuple[bytes, ...]] = {
+            "image/png":       (b"\x89PNG\r\n\x1a\n",),
+            "image/jpeg":      (b"\xff\xd8\xff",),
+            "image/gif":       (b"GIF87a", b"GIF89a"),
+            "image/webp":      (b"RIFF....WEBP",),  # checked by prefix match below
+        }
+        expected = _IMAGE_MAGIC.get(mime)
+        if expected:
+            is_image = any(raw.startswith(prefix) for prefix in expected[:-1])
+            if not is_image and len(expected) == 1:
+                # RIFF/WEBP needs length check — "RIFF....WEBP" means RIFF + 4 bytes + WEBP
+                riff_prefix = expected[0]
+                if not (raw.startswith(b"RIFF") and len(raw) > 8 and raw[-4:] == b"WEBP"):
+                    is_image = False
+            if not is_image:
+                raise ValueError(
+                    f"Declared {mime} but decoded bytes do not match any known "
+                    f"{mime} magic signatures — skipping this inline image part"
+                )
+
         tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
         try:
             with tmp:
-                tmp.write(base64.b64decode(data))
+                tmp.write(raw)
         except Exception:
             # delete=False means a corrupt/unsupported data URL would otherwise
             # leak a zero-byte temp file on every failed materialization.
@@ -3162,7 +3188,16 @@ class AIAgent:
         vision_source = str(image_url or "")
         cleanup_path: Optional[Path] = None
         if vision_source.startswith("data:"):
-            vision_source, cleanup_path = self._materialize_data_url_for_vision(vision_source)
+            try:
+                vision_source, cleanup_path = self._materialize_data_url_for_vision(vision_source)
+            except Exception as e:
+                # Preflight magic-byte guard (issue #29711): skip invalid data
+                # images and fall back to a text description instead of crashing.
+                logger.debug(
+                    "[Vision] _materialize_data_url_for_vision failed for %s: %s",
+                    image_url[:80], e,
+                )
+                return f"[The {role_label} attached an image (validation failed — invalid file type).]"
 
         description = ""
         try:
